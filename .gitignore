@@ -1,0 +1,11 @@
+# 打包产物与临时文件
+dist/
+build/
+build_probe/
+dist_probe/
+__pycache__/
+*.spec
+*.log
+转换器调试.log
+转换器配置.json
+test/
