@@ -71,6 +71,7 @@ IMAGE_MAX_EDGE = 1600
 VIDEO_HEIGHT = 1080
 VIDEO_FPS = 30
 AUDIO_BITRATE_DEFAULT = "320"
+FADE_SEC_DEFAULT = 3  # 音频渐入时长(秒)
 
 
 def _config_file():
@@ -138,6 +139,8 @@ class App:
                 "out_aud": self.out_aud.get(),
                 "preset": self.preset_var.get(),
                 "audio_bitrate": self.audio_var.get(),
+                "fade_in": self.fade_var.get(),
+                "fade_sec": self.fade_sec_var.get(),
             }
             _config_file().write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
@@ -155,6 +158,12 @@ class App:
                     self.preset_var.set(data["preset"])
                 if str(data.get("audio_bitrate", "")) in ("128", "192", "256", "320"):
                     self.audio_var.set(str(data["audio_bitrate"]))
+                self.fade_var.set(bool(data.get("fade_in", True)))
+                try:
+                    sec = int(float(data.get("fade_sec", FADE_SEC_DEFAULT)))
+                    self.fade_sec_var.set(str(max(1, min(10, sec))))
+                except (ValueError, TypeError):
+                    self.fade_sec_var.set(str(FADE_SEC_DEFAULT))
         except Exception:
             pass
 
@@ -205,6 +214,14 @@ class App:
         cb = ttk.Combobox(opt, textvariable=self.audio_var, width=5, state="readonly",
                           values=("128", "192", "256", "320"))
         cb.pack(side="left")
+        # 音频渐入选项（作用于所有音频, 含已压缩音频重编码）
+        self.fade_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="渐入", variable=self.fade_var,
+                        command=self._save_config).pack(side="left", padx=(20, 2))
+        self.fade_sec_var = tk.StringVar(value=str(FADE_SEC_DEFAULT))
+        tk.Spinbox(opt, from_=1, to=10, width=3, textvariable=self.fade_sec_var,
+                   justify="center").pack(side="left")
+        ttk.Label(opt, text="秒").pack(side="left", padx=(2, 0))
 
         # 开始
         go = ttk.Frame(frm)
@@ -385,17 +402,25 @@ class App:
                 return
         crf, iq = PRESETS[self.preset_var.get()]
         ab = self.audio_var.get() + "k"
+        # 渐入参数: 开启时取 1~10 秒, 非法输入回退默认
+        fade_sec = None
+        if self.fade_var.get():
+            try:
+                fade_sec = max(1, min(10, int(float(self.fade_sec_var.get()))))
+            except ValueError:
+                fade_sec = FADE_SEC_DEFAULT
+            self.fade_sec_var.set(str(fade_sec))
         self._save_config()
         self.running, self.cancel = True, False
         self.go_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.progress.config(value=0, maximum=len(self.files))
-        threading.Thread(target=self._worker, args=(list(self.files), dirs, crf, iq, ab), daemon=True).start()
+        threading.Thread(target=self._worker, args=(list(self.files), dirs, crf, iq, ab, fade_sec), daemon=True).start()
 
     def stop(self):
         self.cancel = True
 
-    def _worker(self, files, dirs, crf, iq, ab):
+    def _worker(self, files, dirs, crf, iq, ab, fade_sec=None):
         done = ok = fail = copied = skipped_nodir = skipped_missing = skipped_exist = 0
         total = len(files)
         for f in files:
@@ -426,9 +451,13 @@ class App:
                     r = self._video(f, odir, crf)
                 elif ext in IMAGE_EXTS:
                     r = self._image(f, odir, iq)
+                elif fade_sec:
+                    # 渐入开启: 所有音频(含已压缩)都重编码加渐入(方案B)
+                    r = self._audio(f, odir, ab, fade_sec)
                 elif ext in AUDIO_LOSSLESS:
                     r = self._audio(f, odir, ab)
-                else:  # 已压缩的音频: 重编码只会更糊, 直接把原件复制到导出目录
+                else:
+                    # 渐入关闭且已是压缩音频: 重编码只会更糊, 原件复制到导出目录
                     dst = odir / f.name
                     if dst.exists():
                         r = f"[跳过] {f.name}: 已是压缩音频且导出目录已有同名文件，不处理"
@@ -508,18 +537,40 @@ class App:
         im.save(dst, "JPEG", quality=quality, optimize=True, progressive=True, subsampling=0)
         return f"[OK] {src.name} {w}x{h} -> {im.size[0]}x{im.size[1]}  {human(src.stat().st_size)} -> {human(dst.stat().st_size)}"
 
-    def _audio(self, src, odir, bitrate):
+    def _audio_duration(self, src):
+        """用 ffmpeg 读取音频时长(秒), 失败返回 None"""
+        try:
+            r = subprocess.run([FFMPEG, "-i", str(src)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                               errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+            for line in r.stderr.splitlines():
+                if "Duration:" in line:
+                    h, m, s = line.split("Duration:")[1].split(",")[0].strip().split(":")
+                    return int(h) * 3600 + int(m) * 60 + float(s)
+        except Exception:
+            pass
+        return None
+
+    def _audio(self, src, odir, bitrate, fade_sec=None):
         dst = odir / (src.stem + ".mp3")
         if dst.exists():
             return f"[跳过] {src.name} -> {dst.name} 已存在"
+        af = []
+        if fade_sec:
+            dur = self._audio_duration(src)
+            # 渐入时长不超过音频本身(留一半正常音量), 超短音频至少 0.2 秒
+            d = min(fade_sec, dur / 2) if dur else fade_sec
+            d = max(d, 0.2)
+            af = ["-af", f"afade=t=in:st=0:d={d:.2f}"]
         r = subprocess.run([FFMPEG, "-y", "-i", str(src), "-vn",
-                            "-c:a", "libmp3lame", "-b:a", bitrate, str(dst)],
+                            "-c:a", "libmp3lame", "-b:a", bitrate, *af, str(dst)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         if r.returncode != 0:
             dst.unlink(missing_ok=True)
             return f"[失败] {src.name}: ffmpeg 编码出错"
-        return f"[OK] {src.name} -> {dst.name}  {human(src.stat().st_size)} -> {human(dst.stat().st_size)}"
+        tag = f"（渐入 {float(af[1].split('=')[-1]):.1f}s）" if fade_sec else ""
+        return f"[OK] {src.name} -> {dst.name} {tag} {human(src.stat().st_size)} -> {human(dst.stat().st_size)}"
 
     # ---------- 日志 ----------
     def _drain_log(self):
