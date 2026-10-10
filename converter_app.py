@@ -72,6 +72,7 @@ VIDEO_HEIGHT = 1080
 VIDEO_FPS = 30
 AUDIO_BITRATE_DEFAULT = "320"
 FADE_SEC_DEFAULT = 3  # 音频渐入时长(秒)
+VIDEO_COPY_MAX_KBPS = 6000  # 视频达标复制的码率上限(kbps), 高于此值视为"超标"需重压
 
 
 def _config_file():
@@ -448,27 +449,29 @@ class App:
                 odir = Path(out_dir)
                 odir.mkdir(parents=True, exist_ok=True)
                 if ext in VIDEO_EXTS:
-                    r = self._video(f, odir, crf)
+                    ok_v, why = self._video_compliant(f)
+                    r = (self._copy_original(f, odir, f"已达标视频({why})")
+                         if ok_v else self._video(f, odir, crf))
                 elif ext in IMAGE_EXTS:
-                    r = self._image(f, odir, iq)
+                    ok_i, why = self._image_compliant(f)
+                    r = (self._copy_original(f, odir, f"已达标图片({why})")
+                         if ok_i else self._image(f, odir, iq))
                 elif fade_sec:
                     # 渐入开启: 所有音频(含已压缩)都重编码加渐入(方案B)
                     r = self._audio(f, odir, ab, fade_sec)
                 elif ext in AUDIO_LOSSLESS:
                     r = self._audio(f, odir, ab)
                 else:
-                    # 渐入关闭且已是压缩音频: 重编码只会更糊, 原件复制到导出目录
-                    dst = odir / f.name
-                    if dst.exists():
-                        r = f"[跳过] {f.name}: 已是压缩音频且导出目录已有同名文件，不处理"
+                    # 已压缩音频: 实际码率 ≤ 目标码率才复制, 超标(如320k源配128k目标)则重压
+                    kbps = self._audio_bitrate_kbps(f)
+                    target = int(ab.rstrip("k"))
+                    if kbps is not None and kbps <= target + 8:  # 容差8kbps, 探测有舍入
+                        r = self._copy_original(f, odir, f"已达标({kbps:.0f}kbps ≤ 目标{target}k)")
                     else:
-                        try:
-                            shutil.copy2(f, dst)
-                            r = f"[复制] {f.name}: 已是压缩音频(mp3/m4a等)不转码，原件已复制到导出目录"
-                        except Exception as ce:
-                            r = f"[失败] {f.name}: 复制到导出目录出错({ce})"
-                    self.log_q.put(r)
-                    continue
+                        why = f"码率{kbps:.0f}kbps > 目标{target}k" if kbps else "码率探测失败"
+                        r = self._audio(f, odir, ab)
+                        if r.startswith("[OK]"):
+                            r += f"（{why}，已重压）"
                 self.log_q.put(r)
                 if r.startswith("[OK]"):
                     ok += 1
@@ -496,6 +499,91 @@ class App:
         self.log_q.put(f"== 完成: 成功 {ok} 个, 失败 {fail} 个{extra} ==")
         self.log_q.put(("__progress__", total))
         self.log_q.put("__done__")
+
+    # ---------- 达标探测: 已符合标准的文件走复制通道, 不重复转码 ----------
+    def _probe(self, src):
+        """用 `ffmpeg -i` 的流信息探测媒体参数(零额外依赖), 失败返回 None"""
+        import re
+        try:
+            r = subprocess.run([FFMPEG, "-i", str(src)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                               errors="replace", creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception:
+            return None
+        info = {"codec": None, "width": 0, "height": 0, "fps": 0.0,
+                "video_kbps": 0.0, "audio_kbps": None, "total_kbps": 0.0}
+        for line in (r.stderr or "").splitlines():
+            if "Video:" in line:
+                m = re.search(r"Video: ([0-9A-Za-z_]+)", line)
+                if m and not info["codec"]:
+                    info["codec"] = m.group(1)
+                m = re.search(r"(\d{2,5})x(\d{2,5})", line)
+                if m and not info["width"]:
+                    info["width"], info["height"] = int(m.group(1)), int(m.group(2))
+                m = re.search(r"([\d.]+) fps", line)
+                if m and not info["fps"]:
+                    info["fps"] = float(m.group(1))
+                m = re.search(r"(\d+) kb/s", line)
+                if m and not info["video_kbps"]:
+                    info["video_kbps"] = float(m.group(1))
+            elif "Audio:" in line:
+                m = re.search(r"(\d+) kb/s", line)
+                if m and info["audio_kbps"] is None:
+                    info["audio_kbps"] = float(m.group(1))
+            elif "bitrate:" in line:
+                m = re.search(r"bitrate: (\d+) kb/s", line)
+                if m and not info["total_kbps"]:
+                    info["total_kbps"] = float(m.group(1))
+        return info
+
+    def _copy_original(self, src, odir, reason):
+        """达标文件原件复制到导出目录(保留时间戳等属性)"""
+        dst = odir / src.name
+        if dst.exists():
+            return f"[跳过] {src.name}: {reason}，且导出目录已有同名文件"
+        try:
+            shutil.copy2(src, dst)
+            return f"[复制] {src.name}: {reason}，直接复制  {human(src.stat().st_size)}"
+        except Exception as ce:
+            return f"[失败] {src.name}: 复制出错({ce})"
+
+    def _video_compliant(self, src):
+        """视频达标 = mp4容器 + H.264 + ≤1080p + ≤30fps + 码率≤阈值"""
+        if src.suffix.lower() != ".mp4":
+            return False, "非mp4容器"
+        d = self._probe(src)
+        if not d:
+            return False, "探测失败"
+        if d["codec"] != "h264":
+            return False, f"编码是{d['codec']}"
+        w, h = d["width"], d["height"]
+        if w > 1920 or h > VIDEO_HEIGHT:
+            return False, f"分辨率{w}x{h}超标"
+        if d["fps"] > VIDEO_FPS + 1:  # 容许 29.97 这类小数帧率
+            return False, f"帧率{d['fps']:.0f}超标"
+        br = d["video_kbps"] or d["total_kbps"]
+        if br > VIDEO_COPY_MAX_KBPS:
+            return False, f"码率{br:.0f}kbps超标"
+        return True, f"H.264 {w}x{h} {d['fps']:.0f}fps {br:.0f}kbps"
+
+    def _image_compliant(self, src):
+        """图片达标 = 本来就是 jpg/jpeg 且最长边 ≤ 1600"""
+        if src.suffix.lower() not in (".jpg", ".jpeg"):
+            return False, ""
+        try:
+            from PIL import Image
+            with Image.open(src) as im:
+                w, h = im.size
+            return (max(w, h) <= IMAGE_MAX_EDGE), f"jpg {w}x{h} ≤{IMAGE_MAX_EDGE}px"
+        except Exception:
+            return False, ""
+
+    def _audio_bitrate_kbps(self, src):
+        """探测音频实际码率(kbps), 失败返回 None"""
+        d = self._probe(src)
+        if not d:
+            return None
+        return d["audio_kbps"] or d["total_kbps"] or None
 
     def _video(self, src, odir, crf):
         dst = odir / (src.stem + ".mp4")
